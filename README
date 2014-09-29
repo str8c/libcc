@@ -1,0 +1,6 @@
+early stages of a C (subset) compiler for 64bit x86
+goals: speed, no dependencies, relatively simple
+"K" as in "hard C"
+
+#License
+GPLv3 unless otherwise specified
