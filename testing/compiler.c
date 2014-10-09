@@ -4,22 +4,21 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
-
-int compile(void *dest, char *src, bool (*cb_functions)(char*, void*), void* (*cb_linker)(char*));
+#include "../libcc.h"
 
 int (*test)(int, int, int, int*);
 
-bool callback_func(char *name, void *ptr)
+bool callback_func(void *cb_data, char *name, void *ptr)
 {
-    printf("callback: %s\n", name);
+    printf("callback: %s %p\n", name, cb_data);
     test = ptr;
 
     return 1;
 }
 
-void* callback_link(char *name)
+void* callback_link(void *cb_data, char *name)
 {
-    printf("callback2: %s\n", name);
+    printf("callback2: %s %p\n", name, cb_data);
     return NULL;
 }
 
@@ -60,7 +59,7 @@ int main(int argc, char *argv[])
     }
 
     exec = mmap(NULL, 65536, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
-    len = compile(exec, src, callback_func, callback_link);
+    len = compile(exec, src, callback_func, callback_link, NULL);
     if(len < 0) {
         printf("error: %i\n", len);
         return 1;

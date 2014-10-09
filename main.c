@@ -4,10 +4,20 @@
 #include <stdint.h>
 #include <string.h>
 
+/* self reminders
+    -pointer and temporary
+    -types behaviour
+ */
+
+/* useful working macros */
+#define ERROR return (-__LINE__)
+#define TODO printf("TODO %u\n", __LINE__); ERROR
+#define elserror else {ERROR;}
+
 typedef struct {
-    uint8_t type, var;
-    char name[14];
-} VAR_DEF;
+    uint8_t type, pointer, var;
+    char name[13];
+} VARDEF;
 
 typedef struct {
     uint8_t type, reg;
@@ -15,14 +25,42 @@ typedef struct {
 } VAR;
 
 typedef struct {
-    char name[16];
-    uint8_t args, ret_type, arg_type[4];
-    uint16_t code_length;
+    char name[10];
+    uint8_t ret_type, args;
+    uint16_t var_base, code_length;
     uint8_t *code;
-    VAR var[56];
+    VAR *var;
 } FUNC;
 
-static uint8_t* x86_64(uint8_t *exec, FUNC *f, uint64_t *consts);
+typedef struct {
+    int nconst;
+    uint8_t *codep, *codestart;
+    VAR *v1, *v2;
+    VARDEF *vd;
+    FUNC *f;
+    uint64_t constant[256]; //256 * 8 = 2k
+    VARDEF vardef[256]; //256 * 16 = 4k
+    FUNC func[256]; //256 * 32 = 8k
+    VAR var[4096]; //4096 * 4 = 16k
+    uint8_t code[32768]; // 32k
+} GLOBAL;
+
+enum {
+    /* take 2 variables */
+    OP_ADD, OP_OR, OP_SET, OP_RET, OP_AND, OP_SUB, OP_XOR,
+    OP_MUL, OP_MOD, OP_DIV, OP_RSHIFT, OP_LSHIFT,
+    OP_ANDL, OP_ORL, OP_EQ, OP_NEQ, OP_GT, OP_GTE, OP_LT, OP_LTE,
+
+    /* take 1 variable */
+    OP_NOT, OP_NEG,
+
+    /* other */
+    OP_CALL, OP_CALLC,
+
+    /* control */
+    OP_JMP_IF, OP_JMP_WHILE,
+    OP_LABEL_IF, OP_LABEL_LOOP_START, OP_LABEL_LOOP_END, OP_BREAK, OP_CONTINUE,
+};
 
 enum {
     CHAR, INT, LONG, SHORT, VOID,
@@ -33,679 +71,27 @@ static const char *type_name[] = {
 };
 
 enum {
-    STATIC
+    STATIC, STRUCT, ENUM, TYPEDEF,
 };
 
-static const char *type_mod[] = {
-    "static",
-};
-
-static const uint8_t type_size[] = {
-    1, 4, 8, 2, 1,
+static const char *etc[] = {
+    "static", "struct", "enum", "typedef",
 };
 
 enum {
-    BREAK, CONTINUE, DO, ELSE, GOTO, IF, RETURN, WHILE,
+    BREAK, CONTINUE, DO, ELSE, IF, RETURN,
 };
 
-static const char *keyword[] = {
-    "break", "continue", "do", "else", "goto", "if", "return", "while",
-};
-
-enum {
-    /* take 2 variables */
-    OP_ADD, OP_OR, OP_SET, OP_RET, OP_AND, OP_SUB, OP_XOR,
-    OP_JMP_IF, OP_MUL, OP_MOD, OP_DIV, OP_RSHIFT, OP_LSHIFT,
-    OP_ANDL, OP_ORL, OP_EQ, OP_NEQ, OP_GT, OP_GTE, OP_LT, OP_LTE,
-
-    /* take 1 variable */
-    OP_NOT, OP_NEG,
-
-    /* other */
-    OP_CALL, OP_CALLC, OP_LABEL,
+static const char *control_name[] = {
+    "break", "continue", "do", "else", "if", "return",
 };
 
 static const char *op_str[] = { /* same order as in enum */
-    "+", "|", "", "", "&", "-", "^", "", "*", "%", "/", ">>", "<<",
+    "+", "|", "", "", "&", "-", "^", "*", "%", "/", ">>", "<<",
     "&&", "||",  "==", "!=", ">", ">=", "<", "<=", "!",
 };
 
-static char* strcmpp(char *a, const char *b)
-{
-    while(*a && *b && *a++ == *b++);
-    return a;
-}
-
-static char* strcmpb(char *a, const char *b)
-{
-    do {
-        if(!*a || *a++ != *b++) {
-            return NULL;
-        }
-    } while(*b);
-    return a;
-}
-
-static int matchopeq(char **src)
-{
-    int i;
-    char *r;
-
-    i = 0;
-    do {
-        r = strcmpp(*src, op_str[i]);
-        if(*r == '=') {
-            *src = r;
-            return i;
-        }
-    } while(++i <= OP_LSHIFT);
-
-    return -1;
-}
-
-static int matchop(char **src)
-{
-    int i;
-    char *r;
-
-    i = 0;
-    do {
-        r = strcmpb(*src, op_str[i]);
-        if(r) {
-            *src = r;
-            return i;
-        }
-    } while(++i < sizeof(op_str) / sizeof(*op_str));
-
-    return -1;
-}
-
-#define match(word, list) _match(word, list, sizeof(list)/sizeof(*list) - 1)
-static int _match(const char *word, const char **list, int i)
-{
-    /* i is index of last valid string in the list */
-    do {
-        if(!strcmp(word, list[i])) {
-            return i;
-        }
-    } while(i--);
-    return -1;
-}
-
-static FUNC* matchfunc(FUNC *start, FUNC *end, char *name)
-{
-    do {
-        if(!strcmp(start->name, name)) {
-            return start;
-        }
-    } while(++start != end);
-
-    return NULL;
-}
-
-static VAR_DEF* matchvardef(VAR_DEF *start, VAR_DEF *end, char *name)
-{
-    if(start == end) { //remove this at some point
-        return NULL;
-    }
-
-    do {
-        if(!strcmp(start->name, name)) {
-            return start;
-        }
-    } while(++start != end);
-
-    return NULL;
-}
-
-static bool alpha(char ch)
-{
-    return (ch >= 'a' && ch <= 'z');
-}
-
-static bool digit(char ch)
-{
-    return (ch >= '0' && ch <= '9');
-}
-
-static bool alnum(char ch)
-{
-    return (alpha(ch) || digit(ch));
-}
-
-enum { /* "expect" values */
-    GENERIC,
-    OPEQ,
-    OP,
-    VALUE,
-    VALUE2,
-    VALUE_END,
-    TYPE,
-    NAME_DEC,
-    NAME,
-    NEW_BLOCK,
-};
-
-enum { /* "control" values */
-    VAR_DEC,
-    FUNC_DEC,
-    FUNC_DEC_ARGS,
-    FUNC_DEC_DONE,
-    CODE,
-    CODE_IF,
-    CODE_DO,
-    CODE_WHILE,
-    CODE_RETURN,
-};
-
-//debugging macros
-#define ERROR (-__LINE__)
-#define TODO printf("TODO %u\n", __LINE__);
-
-/* compiles src (C code) into into dest (machine code)
-    dest must be large enough (TODO: pass size of dest and make it SAFE)
-    src must have non-zero length and will be modified
-    cb_function() called for each (non-static) defined function, with its name and address
-        cb_function() should return 0 if the function will not be needed and 1 otherwise
-        note: cb_function gives a pointer to a function, but it can only be called after
-            compile() has returned
-    ccb_link() called for each function used but not defined in the code, passing the name
-        and expecting the function's address in return
-    return value
-        ( >= 0) length of machine code written into dest
-        ( < 0) error code
-notes:
-    takes around 50-52k of stack space
-
-    loops twice through the code: once through the plain text, generating an intermediary
-        byte code, then through this byte code to convert it into machine code. This is required
-        because knowledge of labels, variable lifetimes, function definitions,
-        etc, requires parsing the code at least once
-*/
-int compile(void *dest, char *src, bool (*cb_function)(char*, void*), void* (*cb_link)(char*))
-{
-    char *word, ch;
-    int control, expect, type, value, op, depth, block_depth, tmpvars, con;
-    bool num;
-    uint8_t varset, vararg, pointer_flag, opinfo_main, *codep;
-    FUNC *f, *g, *h;
-    VAR *v;
-    VAR_DEF *vd, *vdef;
-    void *exec;
-
-    /* use stack for storage */
-    VAR_DEF var_def[32];
-    FUNC function[64]; //16k
-    uint64_t constant[256]; //2k
-    uint8_t depth_var[128], opinfo[128], blocktype[32];
-    uint8_t code[32768]; //32k
-
-    /* initialization */
-    ch = *src;
-    control = FUNC_DEC;
-    expect = TYPE;
-    g = function;
-    vd = var_def;
-    tmpvars = 0;
-    codep = code;
-    depth = -1;
-    block_depth = 0;
-    con = 0;
-#define tmp(x) ((x) | 128)
-
-    do {
-        num = digit(ch);
-        if(alpha(ch) || num) {
-            word = src;
-            do {
-                ch = *(++src);
-            } while(alnum(ch));
-            *src = 0;
-
-            switch(expect) {
-            case GENERIC:
-                if(num) {
-                    return ERROR;
-                }
-
-                if(control != CODE) {
-                    return ERROR;
-                }
-
-                type = match(word, type_name);
-                if(type >= 0) {
-                    control = VAR_DEC;
-                    expect = NAME_DEC;
-                    break;
-                }
-
-                value = match(word, keyword);
-                if(value >= 0) {
-                    if(value == IF) {
-                        control = CODE_IF;
-                        expect = VALUE;
-                    } else if(value == DO) {
-                        control = CODE_DO;
-                        expect = NEW_BLOCK;
-                    } else if(value == WHILE) {
-                        control = CODE_WHILE;
-                        expect = VALUE;
-                    } else if(value == RETURN) {
-                        control = CODE_RETURN;
-                        expect = VALUE;
-                    } else {
-                        TODO;
-                        return ERROR;
-                    }
-                    break;
-                }
-
-                h = matchfunc(function, g, word);
-                if(h) {
-                    TODO;
-                    break;
-                }
-
-                vdef = matchvardef(var_def, vd, word);
-                if(vdef) {
-                    expect = OPEQ;
-                    break;
-                }
-
-                return ERROR;
-            case TYPE:
-                if(num) {
-                    return ERROR;
-                }
-
-                type = match(word, type_name);
-                if(type < 0) {
-                    value = match(word, type_mod);
-                    if(value < 0) {
-                        return ERROR;
-                    }
-
-                    TODO;
-                } else {
-                    expect = NAME_DEC;
-                }
-                break;
-            case NAME_DEC:
-                if(num) {
-                    return ERROR;
-                }
-
-                if(control == VAR_DEC) {
-                    vdef = matchvardef(var_def, vd, word);
-                    if(vdef) {
-                        return ERROR;
-                    }
-
-                    vd->type = type | pointer_flag;
-                    vd->var = 0xFF;
-                    strcpy(vd->name, word);//MAX LENGTH
-                    vd++;
-
-                    expect = GENERIC;
-                } else if(control == FUNC_DEC) {
-                    f = (function != g) ? matchfunc(function, g, word) : NULL;
-                    if(!f) {
-                        f = g++;
-                    }
-
-                    f->args = 0;
-
-                    strcpy(f->name, word); //MAX LENGTH
-                    f->ret_type = type | pointer_flag;
-                    expect = GENERIC;
-                } else if(control == FUNC_DEC_ARGS) {
-                    vdef = matchvardef(var_def, vd, word);
-                    if(vdef) {
-                        return ERROR;
-                    }
-
-                    vd->type = type | pointer_flag;
-                    vd->var = (v - f->var);
-                    strcpy(vd->name, word);//MAX LENGTH
-                    vd++;
-
-                    v->type = vd->type;
-                    v->reg = 0xFF;
-                    v->last_use = 0xFFFF;
-                    v++;
-
-                    f->args++;
-                    expect = GENERIC;
-                } else {
-                    return ERROR;
-                }
-
-                pointer_flag = 0;
-                break;
-            case VALUE:
-                if(num) {
-                    if(depth < 0) {
-                        TODO;
-                    } else if(depth_var[depth] != 0xFF) {
-                        *codep++ = opinfo[depth] | 64;
-                        *codep++ = tmp(tmpvars);
-                        *codep++ = con;
-
-                        constant[con++] = strtol(word, NULL, 0);
-
-                        depth_var[depth] = 0xFF;
-                        expect = VALUE_END;
-
-                        printf("tmp %u op %u (%u);\n", tmpvars, (int)constant[con - 1], opinfo[depth]);
-                    } else {
-                        TODO;
-                    }
-                    break;
-                }
-
-                vdef = matchvardef(var_def, vd, word);
-                if(vdef) {
-                    if(depth < 0) {
-                        vararg = vdef->var;
-                        expect = VALUE_END;
-                    } else if(depth_var[depth] != 0xFF) {
-                        printf("tmp %u op %s (%u);\n", tmpvars, word, opinfo[depth]);
-
-                        *codep++ = opinfo[depth];
-                        *codep++ = tmp(tmpvars);
-                        *codep++ = vdef->var;
-
-                        f->var[vdef->var].last_use = (codep - f->code);
-                        depth_var[depth] = 0xFF;
-                        expect = VALUE_END;
-                    } else {
-                        printf("tmp %u = %s (%u %u);\n", tmpvars, word, vdef->var, opinfo[depth]);
-
-                        *codep++ = OP_SET | opinfo[depth];
-                        *codep++ = tmp(tmpvars);
-                        *codep++ = vdef->var;
-
-                        f->var[vdef->var].last_use = (codep - f->code);
-                        opinfo[depth] = 0;
-                        depth_var[depth] = tmpvars;
-                        expect = OP;
-                    }
-                    break;
-                }
-
-                return ERROR;
-            default:
-                return ERROR;
-            }
-        }
-
-        if(ch == ' ' || ch == '\n') {
-            continue;
-        }
-
-        switch(expect) {
-        case GENERIC:
-            if(control == CODE) {
-                if(ch == '}') {
-                    if(block_depth) {
-                        block_depth--;
-
-                        if(blocktype[block_depth] == 0) {
-                            *codep++ = OP_LABEL;
-                            *codep++ = 0;
-                        }
-                    } else {
-                        control = FUNC_DEC;
-                        expect = TYPE;
-                        f->code_length = codep - f->code;
-                    }
-                } else if(ch == '/') {
-                    ch = *++(src);
-                    if(ch == '*') {
-                        do {
-                            do {
-                                ch = *++(src);
-                                if(!ch) {
-                                    return ERROR;
-                                }
-                            } while(ch != '*');
-                        } while(*(src + 1) != '/');
-                        src++;
-                    } else if(ch == '/') {
-                        do {
-                            ch = *++(src);
-                            if(!ch) {
-                                return ERROR;
-                            }
-                        } while(ch != '\n');
-                    } else {
-                        return ERROR;
-                    }
-                } else if(ch == '*') {
-                    TODO;
-                }
-            } else if(control == VAR_DEC) {
-                if(ch == ';') {
-                    control = CODE;
-                } else if(ch == ',') {
-                    expect = NAME_DEC;
-                } else {
-                    return ERROR;
-                }
-            } else if(control == FUNC_DEC) {
-                if(ch == '(') {
-                    control = FUNC_DEC_ARGS;
-                    expect = TYPE;
-                    v = f->var;
-                    vd = var_def;
-                } else {
-                    return ERROR;
-                }
-            } else if(control == FUNC_DEC_ARGS) {
-                if(ch == ',') {
-                    expect = TYPE;
-                } else if(ch == ')') {
-                    control = FUNC_DEC_DONE;
-                } else {
-                    return ERROR;
-                }
-            } else if(control == FUNC_DEC_DONE) {
-                if(ch == ';') {
-                    control = FUNC_DEC;
-                    expect = TYPE;
-                    f->code_length = 0;
-                } else if(ch == '{') {
-                    f->code = codep;
-                    control = CODE;
-                    expect = GENERIC;
-                } else {
-                    return ERROR;
-                }
-            } else {
-                return ERROR;
-            }
-            break;
-        case NAME_DEC:
-            if(ch == '*') {
-                pointer_flag = 128;
-            } else {
-                return ERROR;
-            }
-            break;
-        case VALUE:
-            if(ch == '(') {
-                if(depth >= 0) {
-                    if(depth_var[depth] != 0xFF) {
-                        depth_var[depth] = 0xFF;
-                        tmpvars++;
-                    } else {
-                        depth_var[depth] = tmpvars;
-                    }
-                }
-
-                depth++;
-                depth_var[depth] = 0xFF;
-                opinfo[depth] = 0;
-            } else if(ch == '*') {
-                if(depth >= 0) {
-                    opinfo[depth] |= 128;
-                } else {
-                    opinfo_main |= 128;
-                }
-            } else {
-                return ERROR;
-            }
-            break;
-        case VALUE_END:
-            if(ch == ')') {
-                if(depth < 0) {
-                    return ERROR;
-                }
-
-                depth--;
-                if(depth >= 0) {
-                    if(depth_var[depth] != 0xFF) {
-                        expect = OP;
-                    } else {
-                        printf("tmp %u op tmp %u (%u)\n", tmpvars - 1, tmpvars, opinfo[depth]);
-                        *codep++ = opinfo[depth];
-                        *codep++ = tmp(tmpvars - 1);
-                        *codep++ = tmp(tmpvars);
-
-                        tmpvars--;
-                    }
-                } else if(control == CODE_IF) {
-                    expect = NEW_BLOCK;
-                }
-            } else if(ch == ';') {
-                if(depth >= 0) {
-                    return ERROR;
-                }
-
-                if(control == CODE_WHILE) {
-                    printf("jmp up if tmp 0\n");
-
-                    *codep++ = OP_JMP_IF;
-                    *codep++ = tmp(0);
-                    *codep++ = 0;
-
-                    control = CODE;
-                } else if(control == CODE_RETURN) {
-                    printf("ret tmp 0\n");
-                    *codep++ = OP_RET;
-                    *codep++ = tmp(0);
-
-                    control = CODE;
-                } else {
-                    *codep++ = opinfo_main;
-                    *codep++ = varset;
-
-                    if(vararg != 0xFF) {
-                        printf("var %u op var %u (%u)\n", varset, vararg, opinfo_main);
-                        *codep++ = vararg;
-                        f->var[vararg].last_use = codep - f->code;
-                    } else {
-                        printf("var %u op tmp 0 (%u)\n", varset, opinfo_main);
-                        *codep++ = tmp(0);
-                    }
-                }
-
-                expect = GENERIC;
-            } else {
-                return ERROR;
-            }
-            break;
-        case OPEQ:
-            op = matchopeq(&src);
-            if(op < 0) {
-                return ERROR;
-            }
-
-            if(op == OP_SET) {
-                vdef->var = (v - f->var);
-                v->type = vdef->type;
-                v->reg = 0xFF;
-                v->last_use = 0xFFFF;
-                v++;
-            }
-
-            opinfo_main = op;
-
-            varset = vdef->var;
-            vararg = 0xFF;
-            expect = VALUE;
-            break;
-        case OP:
-            if(ch == ')') {
-                if(depth != 0) {
-                    return ERROR;
-                }
-                depth--;
-                expect = VALUE_END;
-                if(control == CODE_IF) {
-                    expect = NEW_BLOCK;
-                }
-                break;
-            }
-
-            op = matchop(&src);
-            if(op < 0) {
-                return ERROR;
-            }
-
-            opinfo[depth] = op;
-
-            expect = VALUE;
-            break;
-        case NEW_BLOCK:
-            if(ch != '{') {
-                return ERROR;
-            }
-
-            if(control == CODE_DO) {
-                *codep++ = OP_LABEL;
-                *codep++ = 1;
-                blocktype[block_depth] = 1;
-            } else { //if(control == CODE_IF)
-                *codep++ = OP_JMP_IF;
-                *codep++ = tmp(0);
-                *codep++ = 1;
-
-                blocktype[block_depth] = 0;
-
-                printf("jmp if not tmp 0\n");
-            }
-
-            block_depth++;
-
-            control = CODE;
-            expect = GENERIC;
-            break;
-        default:
-            return ERROR;
-        }
-    } while((ch = *(++src)));
-
-    f = function;
-    if(f == g) {
-        return ERROR;
-    }
-
-    exec = dest;
-    do {
-        printf("%s %s (); (%u)\n", type_name[f->ret_type], f->name, f->args);
-
-        cb_function(f->name, exec);
-        exec = x86_64(exec, f, constant);
-        if(!exec) {
-            return ERROR;
-        }
-    } while(++f != g);
-
-
-    return exec - dest;
-}
-
+/* begin x86-64 section */
 static const uint8_t regs[] = {
     7, 6, 2, 1, 8, 9, 10, 11, 0xFF
 };
@@ -749,7 +135,7 @@ static uint8_t* op_indirect(uint8_t *p, uint8_t opcode, uint8_t r1, uint8_t r2, 
     return p;
 }
 
-static uint8_t usevar(uint8_t varid, FUNC *f, int *tmpvar, uint16_t *reg, uint16_t i, bool read)
+static uint8_t usereg(uint8_t varid, VAR *var, int *tmpvar, uint16_t *reg, uint16_t i, bool read)
 {
     VAR *v;
     int j;
@@ -794,13 +180,13 @@ static uint8_t usevar(uint8_t varid, FUNC *f, int *tmpvar, uint16_t *reg, uint16
         return ret;
     }
 
-    v = &f->var[varid];
+    v = &var[varid];
     if(read) {
         return v->reg;
     }
 
     if(i > v->last_use) {
-        printf("shn %u %u\n", i, v->last_use);
+        printf("shn %u %u %u\n", i, v->last_use, varid);
     }
 
     if(v->reg == 0xFF) {
@@ -812,13 +198,13 @@ static uint8_t usevar(uint8_t varid, FUNC *f, int *tmpvar, uint16_t *reg, uint16
     return v->reg;
 }
 
-static uint8_t* x86_64(uint8_t *p, FUNC *f, uint64_t *consts)
+static int x86_64(GLOBAL *global, FUNC *f, void **out)
 {
-    uint8_t *c, *endc, *pp;
-    uint8_t cmd, op, r1, r2;
+    uint8_t *p, *c, *endc, *pp;
+    uint8_t op, cmd, r1, r2;
     int i, b, tmpvar;
     uint64_t constant;
-    VAR *v;
+    VAR *v, *var;
 
     uint16_t reg[16];
     uint8_t *block[16];
@@ -835,8 +221,10 @@ static uint8_t* x86_64(uint8_t *p, FUNC *f, uint64_t *consts)
     *exec++ = 0x41; *exec++ = 0x57;
     */
 
+    var = global->var + f->var_base;
+
     for(i = 0; i != f->args; i++) {
-        v = &f->var[i];
+        v = &var[i];
         if(v->last_use != 0xFFFF) {
             v->reg = regs[i];
             reg[v->reg] = v->last_use;
@@ -846,44 +234,44 @@ static uint8_t* x86_64(uint8_t *p, FUNC *f, uint64_t *consts)
 
     tmpvar = 0;
 
+    p = *out;
     c = f->code;
     endc = f->code + f->code_length;
     b = 0;
     while(c < endc) {
         cmd = *c++;
         op = cmd & 0x3F;
-        //printf("op\n");
-        if(op == OP_JMP_IF) {
-            //v = usevar(*c, f, tmpvar, reg, (c + 1) - f->code);
-            c++;
+        printf("%u\n", cmd);
+        if(op == OP_JMP_IF || op == OP_JMP_WHILE) {
+            c++; //assumed always eax
             *p++ = 0x83;
             *p++ = 0xF8;
             *p++ = 0x00;
 
-            if(*c++) {
+            if(op == OP_JMP_IF) {
                 *p++ = 0x74;
                 block[b++] = p++;
             } else {
                 *p++ = 0x75;
                 *p = (block[--b] - (p + 1)); p++;
             }
-        } else if(op == OP_LABEL) {
-            if(*c++) {
-                block[b++] = p;
-            } else {
-                pp = block[--b];
-                *pp = (p - (pp + 1));
-            }
+        } else if(op == OP_LABEL_IF) {
+            pp = block[--b];
+            *pp = (p - (pp + 1));
+        } else if(op == OP_LABEL_LOOP_START) {
+            block[b++] = p;
+        } else if(op == OP_LABEL_LOOP_END) {
+            //continues jump to here
         } else if(op == OP_RET) {
             *p++ = 0xC3;
-            c++;
+            c++; //assumed always eax
         } else if(op < OP_NOT) {
-            r1 = usevar(*c, f, &tmpvar, reg, (c + 1) - f->code, op != OP_SET);
+            r1 = usereg(*c, var, &tmpvar, reg, (c - 1) - f->code, op != OP_SET);
             c++;
             if(!(cmd & 0x40)) {
-                r2 = usevar(*c, f, &tmpvar, reg, (c + 1) - f->code, 0);
+                r2 = usereg(*c, var, &tmpvar, reg, (c - 2) - f->code, 0);
             } else {
-                constant = consts[*c];
+                constant = global->constant[*c];
             }
             c++;
 
@@ -949,18 +337,11 @@ static uint8_t* x86_64(uint8_t *p, FUNC *f, uint64_t *consts)
                     *p++ = 0xB6;
                     *p++ = combine2(0, r1);
                 }
-            } else {
-                printf("%u\n", op);
-                return NULL;
-            }
-        } else {
-            printf("i dont know %u\n", op);
-            return NULL;
-        }
+            } elserror
+        } elserror
     }
     if(c != endc) {
-        printf("%p %p\n", c, endc);
-        return NULL;
+        ERROR;
     }
 
     /* pop */
@@ -973,5 +354,630 @@ static uint8_t* x86_64(uint8_t *p, FUNC *f, uint64_t *consts)
     *exec++ = 0x41; *exec++ = 0x5F;
     */
 
-    return p;
+    *out = p;
+    return 0;
+}
+/* end x86-64 section */
+
+/* add a constant, return its identifier */
+static int toconst(GLOBAL *global, const char *word)
+{
+    //check limit of n
+    //dont duplicate constants
+
+    int n;
+
+    n = global->nconst++;
+    global->constant[n] = strtol(word, NULL, 0);
+
+    return n;
+}
+
+/* find a variable definition from a name */
+static VARDEF* tovardef(GLOBAL *global, const char *name)
+{
+    VARDEF *p, *end;
+
+    p = global->vardef;
+    end = global->vd;
+    while(p != end) { //CHANGE TO DOWHILE
+        if(!strcmp(p->name, name)) {
+            return p;
+        }
+        p++;
+    }
+
+    return NULL;
+}
+
+static VARDEF* addvardef(GLOBAL *global, const char *name, uint8_t type, uint8_t pointer)
+{
+    VARDEF *vd;
+
+    vd = global->vardef;
+    while(vd != global->vd) { //CHANGE TO DOWHILE
+        if(!strcmp(vd->name, name)) {
+            return NULL;
+        }
+        vd++;
+    }
+
+    global->vd++; //CHECK MAX VALUE
+    vd->type = type;
+    vd->pointer = pointer;
+    strcpy(vd->name, name); //CHECK MAX LENGTH
+
+    return vd;
+}
+
+static FUNC* addfunc(GLOBAL *global, const char *name, uint8_t ret_type)
+{
+    FUNC *f;
+
+    f = global->f++; //CHECK MAX VALUE
+
+    f->ret_type = ret_type;
+    f->var_base = global->v2 - global->var;
+    f->code = global->codep;
+    global->v1 = global->v2;
+
+    strcpy(f->name, name); //CHECK MAX LENGTH
+
+    return f;
+}
+
+static void usevar(GLOBAL *global, VARDEF *vd)
+{
+    VAR *v;
+
+    v = global->v2++;
+    v->type = vd->type | (vd->pointer << 5); //temporary pointer type store
+    v->reg = 0xFF;
+
+    vd->var = (v - global->v1);
+}
+
+static void commit(GLOBAL *global, uint8_t op, uint8_t a, uint8_t b)
+{
+    printf("code: %u %u %u\n", op, a, b);
+
+    *global->codep++ = op;
+    *global->codep++ = a;
+    *global->codep++ = b;
+}
+
+static void commit2(GLOBAL *global, uint8_t op, uint8_t a)
+{
+    printf("code: %u %u\n", op, a);
+
+    *global->codep++ = op;
+    *global->codep++ = a;
+}
+
+static void commit3(GLOBAL *global, uint8_t op)
+{
+    printf("code: %u\n", op);
+
+    *global->codep++ = op;
+}
+
+#define match(word, list) _match(word, list, sizeof(list)/sizeof(*list) - 1)
+#define toetc(word) match(word, etc)
+#define totype(word) match(word, type_name)
+#define tocontrol(word) match(word, control_name)
+static int _match(const char *word, const char **list, int i)
+{
+    /* i is index of last valid string in the list */
+    do {
+        if(!strcmp(word, list[i])) {
+            return i;
+        }
+    } while(i--);
+    return -1;
+}
+
+static char* strcmpp(char *a, const char *b)
+{
+    while(*a && *b && *a++ == *b++);
+    return a;
+}
+
+static char* strcmpb(char *a, const char *b)
+{
+    do {
+        if(!*a || *a++ != *b++) {
+            return NULL;
+        }
+    } while(*b);
+    return a;
+}
+
+static int opeq(char **src)
+{
+    int i;
+    char *r;
+
+    i = 0;
+    do {
+        r = strcmpp(*src, op_str[i]);
+        if(*r == '=') {
+            *src = r;
+            return i;
+        }
+    } while(++i <= OP_LSHIFT);
+
+    return -1;
+}
+
+static int opop(char **src)
+{
+    int i;
+    char *r;
+
+    i = 0;
+    do {
+        r = strcmpb(*src, op_str[i]);
+        if(r) {
+            *src = r;
+            return i;
+        }
+    } while(++i < (int)(sizeof(op_str) / sizeof(*op_str)));
+
+    return -1;
+}
+
+static bool alpha(char ch)
+{
+    return (ch >= 'a' && ch <= 'z');
+}
+
+static bool digit(char ch)
+{
+    return (ch >= '0' && ch <= '9');
+}
+
+static bool alnum(char ch)
+{
+    return (alpha(ch) || digit(ch));
+}
+
+static bool ignore(char ch)
+{
+    return (ch == ' ' || ch == '\n');
+}
+
+/* if comment, advance src to end of comment or null terminator and return 1
+ * supports both C and C++ style comments
+ */
+static bool comment(char ch, char **srcp)
+{
+    char *src;
+
+    if(ch != '/') {
+        return 0;
+    }
+
+    src = *srcp;
+    ch = *++(src);
+    if(ch == '*') {
+        do {
+            ch = *++(src);
+            if(!ch) {
+                *srcp = src - 1;
+                return 1;
+            }
+        } while(ch != '*' || *(src + 1) != '/');
+        src++;
+    } else if(ch == '/') {
+        do {
+            ch = *++(src);
+            if(!ch) {
+                *srcp = src - 1;
+                return 1;
+            }
+        } while(ch != '\n');
+    } else {
+        return 0;
+    }
+
+    *srcp = src;
+    return 1;
+}
+
+/* get next word in src, advancing src, setting ch and num */
+///TODO: split into 2 functions, one which supports constants and one which does not
+static char* word(char *chp, char **srcp, bool *nump)
+{
+    char ch, *src, *w;
+    bool num;
+
+    ch = *chp;
+    src = *srcp;
+    num = digit(ch);
+    if(alpha(ch) || num) {
+        w = src;
+        do {
+            ch = *(++src);
+        } while(alnum(ch));
+        *src = 0;
+
+        *chp = ch;
+        *srcp = src;
+        *nump = num;
+        return w;
+    }
+
+    return NULL;
+}
+
+/* parse value (code) in function func, advance src to end */
+static int value(GLOBAL *global, char **srcp)
+{
+    char ch, *src, *w;
+    uint8_t depth, tmp, op, opflags;
+    int control, value;
+    bool constant;
+
+    VARDEF *vd;
+
+    uint8_t dop[16], dpointer[16] = {0};
+    uint8_t dvalue[16];
+
+    depth = 0; tmp = 0;
+    control = 0;
+    src = *srcp;
+    do {
+        ch = *(++src);
+        w = word(&ch, &src, &constant);
+        if(w) {
+            if(control == 0) {
+                if(constant) {
+                    value = toconst(global, w);
+                } else if((vd = tovardef(global, w))) {
+                    value = vd->var;
+                    global->v1[vd->var].last_use = global->codep - global->codestart;
+                } elserror
+
+                if(!depth) {
+                    *src-- = ch; *srcp = src;
+                    return value | (dpointer[depth] << 9) | (constant ? 0x100 : 0);
+                }
+
+                opflags = (dpointer[depth] ? 128 : 0 | (constant) ? 64 : 0);
+                dpointer[depth] = 0;
+
+                if(!dvalue[depth]) {
+                    dvalue[depth] = 1;
+                    commit(global, OP_SET | opflags, tmp | 128, value);
+                    control = 1;
+                } else {
+                    commit(global, dop[depth] | opflags, tmp | 128, value);
+                    control = 2;
+                }
+            } elserror
+        }
+
+        if(!ch) {
+            ERROR;
+        }
+
+        if(ignore(ch) || comment(ch, &src)) {
+            continue;
+        }
+
+        if(control == 0) {
+            if(ch == '(') {
+                if(depth != 0) {
+                    if(dvalue[depth]) {
+                        tmp++;
+                    }
+                }
+
+                depth++;
+                dvalue[depth] = 0;
+            } else if(ch == '*') {
+                dpointer[depth] = 1;//dpointer[depth]++;
+            } elserror
+        } else if(ch == ')') { //control == 1 or 2
+            depth--;
+            if(depth == 0) {
+                *srcp = src;
+                return 128; //
+            }
+
+            if(!dvalue[depth]) {
+                dvalue[depth] = 2;
+                control = 1;
+            } else if(dvalue[depth] == 1) {
+            } else { //==2
+                control = 2;
+                commit(global, dop[depth], (tmp - 1) | 128, tmp | 128);
+                tmp--;
+            }
+        } else if(control == 1) {
+            op = opop(&src);
+            if(op < 0) {
+                ERROR;
+            }
+
+            dop[depth] = op;
+            control = 0;
+        } elserror
+    } while(1);
+}
+
+/* parse code for function func, advance src to end */
+static int code(GLOBAL *global, char **srcp)
+{
+    char ch, *src, *w;
+    uint8_t pointer, lpointer, block, op;
+    int control, type, lvalue, k;
+    bool constant;
+
+    VARDEF *vd;
+
+    uint8_t blocktype[8];
+
+    pointer = 0; lpointer = 0; block = 0;
+    control = 0;
+    src = *srcp;
+    do {
+        ch = *(++src);
+        w = word(&ch, &src, &constant);
+        if(w) {
+            if(control == 0) {
+                if((type = totype(w)) >= 0) {
+                    control = 1;
+                } /*else if((k = totypemod(w)) >= 0) {
+                    TODO;
+                } */else if((k = tocontrol(w)) >= 0) {
+                    if(k == IF) {
+                        *src-- = ch;
+                        k = value(global, &src);
+                        if(k < 0) {
+                            return k;
+                        }
+
+                        commit2(global, OP_JMP_IF, k); //k always TMP0
+                        blocktype[block++] = 0; control = 5;
+                        continue;
+                    } else if(k == ELSE) {
+                        TODO;
+                    } else if(k == DO) {
+                        commit3(global, OP_LABEL_LOOP_START);
+                        blocktype[block++] = 1; control = 5;
+                    } else if(k == CONTINUE) {
+                        commit3(global, OP_CONTINUE);
+                    } else if(k == BREAK) {
+                        commit3(global, OP_BREAK);
+                    } else { //if(k == RETURN)
+                        *src-- = ch;
+                        k = value(global, &src);
+                        if(k < 0) {
+                            return k;
+                        }
+
+                        commit2(global, OP_RET, k); //k always TMP0
+                        control = 4;
+                        continue;
+                    }
+                } else if((vd = tovardef(global, w))) {
+                    lvalue = vd->var; control = 3;
+                } /*else if(f = tofunc(global, w)) {
+                    TODO;
+                } */ elserror
+            } else if(control == 1) {
+                if(!addvardef(global, w, type, pointer)) {
+                    ERROR;
+                }
+                pointer = 0; control = 2;
+            } else if(control == 6) {
+                if(strcmp(w, "while")) {
+                    ERROR;
+                }
+
+                *src-- = ch;
+                k = value(global, &src);
+                if(k < 0) {
+                    return k;
+                }
+
+                commit2(global, OP_JMP_WHILE, k); //k always TMP0
+                control = 4;
+                continue;
+            } else {
+                printf("%u\n", control);
+                ERROR;
+            }
+        }
+
+        if(!ch) {
+            ERROR;
+        }
+
+        if(ignore(ch) || comment(ch, &src)) {
+            continue;
+        }
+
+        if(control == 0) {
+            if(ch == '*') {
+                src++;
+                k = value(global, &src);
+                if(k < 0) {
+                    return k;
+                }
+                lvalue = k;
+                lpointer = 1;
+                control = 3;
+            } else if(ch == '}') {
+                if(!block) {
+                    break;
+                }
+                block--;
+
+                if(blocktype[block] == 1) {
+                    commit3(global, OP_LABEL_LOOP_END);
+                    control = 6;
+                } else {
+                    commit3(global, OP_LABEL_IF);
+                }
+            } elserror
+        } else if(control == 1) {
+            if(ch == '*') {
+                pointer++;
+            } elserror
+        } else if(control == 2) {
+            if(ch == ',') {
+                control = 1;
+            } else if(ch == ';') {
+                control = 0;
+            } elserror
+        } else if(control == 3) {
+            op = opeq(&src);
+            if(op < 0) {
+                ERROR;
+            }
+
+            k = value(global, &src);
+            if(k < 0) {
+                return k;
+            }
+
+            if(op == OP_SET && !lpointer) {
+                usevar(global, vd);
+                lvalue = vd->var;
+            }
+
+            commit(global, op | ((k >> 2) & 0xC0), lvalue | (lpointer << 8), k);
+            lpointer = 0;
+            control = 4;
+        } else if(control == 4) {
+            if(ch != ';') {
+                ERROR;
+            }
+            control = 0;
+        } else if(control == 5) {
+            if(ch != '{') {
+                ERROR;
+            }
+            control = 0;
+        } elserror
+    } while(1);
+
+    *srcp = src;
+    return 0;
+}
+
+int compile(void *dest, char *src, bool (*cb_func)(void*, char*, void*), void* (*cb_link)(void*, char*),
+            void *cb_data)
+{
+    char ch, *w, *name;
+    uint8_t pointer, ret_type;
+    bool constant;
+    int type, k, control;
+    void *exec;
+
+    VARDEF *vd, *vardef;
+    FUNC *f;
+
+    GLOBAL global_data, *global = &global_data;
+
+    global->nconst = 0;
+    global->codep = global->code;
+    global->v2 = global->var;
+    global->vd = global->vardef;
+    global->f = global->func;
+
+    pointer = 0;
+    control = 0;
+    ch = *src;
+    do {
+        w = word(&ch, &src, &constant);
+        if(w) {
+            if(control == 0) {
+                if((type = totype(w)) >= 0) {
+                    ret_type = type;
+                    control = 1;
+                } else if((k = toetc(w)) >= 0) {
+                    TODO;
+                } elserror
+            } else if(control == 1) {
+                name = w;
+                control = 2;
+            } else if(control == 3) {
+                type = totype(w);
+                if(type < 0) {
+                    ERROR;
+                }
+
+                control = 4;
+            } else if(control == 4) {
+                vd = addvardef(global, w, type, pointer);
+                if(!vd) {
+                    ERROR;
+                }
+
+                usevar(global, vd);
+                f->args++;
+
+                pointer = 0;
+                control = 5;
+            } elserror
+        }
+
+        if(ignore(ch) || comment(ch, &src)) {
+            continue;
+        }
+
+        if(control == 1 || control == 4) {
+            if(ch == '*') {
+                pointer++;
+            } elserror
+        } else if(control == 2) {
+            if(ch == '(') {
+                f = addfunc(global, name, ret_type);
+                vardef = global->vd;
+                global->codestart = f->code;
+                control = 3;
+            } else if(ch == ',') {
+                TODO;
+            } else if(ch == ';') {
+                TODO;
+            } elserror
+        } else if(control == 5) {
+            if(ch == ',') {
+                control = 3;
+            } else if(ch == ')') {
+                control = 6;
+            } elserror
+        } else if(control == 6) {
+            if(ch == '{') {
+                k = code(global, &src);
+                if(k < 0) {
+                    return k;
+                }
+                f->code_length = global->codep - f->code;
+                global->vd = vardef;
+            } else if(ch == ';') {
+                TODO;
+            } elserror
+        } elserror
+    } while((ch = *(++src)));
+
+    exec = dest;
+    f = global->func;
+    while(f != global->f) { //CHANGE TO DOWHILE
+        printf("%s %s %u %u %p %u\n", f->name, type_name[f->ret_type], f->args, f->var_base,
+               f->code, f->code_length);
+
+        cb_func(cb_data, f->name, exec);
+        k = x86_64(global, f, &exec);
+        if(k < 0) {
+            return k;
+        }
+
+        f++;
+    }
+
+    return (exec - dest);
 }
